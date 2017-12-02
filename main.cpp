@@ -14,68 +14,66 @@
 #include "pcg/pcg_random.hpp"
 #include "pcg/pcg_extras.hpp"
 
+//generates a part of distribution and writes it to the supplied vector
 template<class Distribution, typename value_type>
-value_type new_value_with_discard(
+void fill_sample_part(
+	std::vector<value_type> &dest,
+	size_t part_begin,
+	size_t part_size,
 	Distribution &distribution,
 	pcg32 &rng,
-	size_t discard = 1
+	size_t jump_mult = 1
 ) {
-	if (discard == 1) return distribution(rng);
-
 	pcg32 rng_copy = rng;
-	value_type res = distribution(rng_copy);
 
-	if (rng_copy - rng > discard) throw std::runtime_error("Generator was used more than <discard> times.");
+	size_t part_end = part_begin + part_size;
 
-	rng.advance(discard);
-	return res;
+	for (size_t i = part_begin; i < part_end; ++i) {
+		dest[i] = distribution(rng);
+	}
+
+	rng_copy.advance(part_size*jump_mult);
+	rng = rng_copy;
 }
+
 
 //nonparallel function for creating a sample of a distribution
 template<class Distribution, typename value_type>
 std::vector<value_type> distribution_sample(
 	size_t size,
-	Distribution& dist,
+	Distribution& distribution,
 	pcg32& rng,
-	size_t discard = 1
+	size_t parts,
+	size_t jump_mult = 1
 ) {
 	std::vector<value_type> result(size);
-	for (size_t i = 0; i < size; ++i) {
-		result[i] = 
-			new_value_with_discard<Distribution, value_type>(
-				dist, 
-				rng, 
-				discard
-				);
-	}
-	return result;
-}
+	
+	size_t part_size = size / parts;
 
-//used in distribution_sample_parallel
-//generates a part of distribution and writes it to the supplied vector
-template<class Distribution, typename value_type>
-void fill_sample_part(
-	size_t size,
-	Distribution &distribution,
-	pcg32 &rng,
-	size_t steps,
-	std::vector<value_type> &dest,
-	size_t from,
-	size_t discard = 1
-) {
-	pcg32 rng_copy = rng;
-	if(steps > 0) rng_copy.advance(steps * discard);
-
-	size_t end = from + size;
-
-	for (size_t i = from; i < end; ++i) {
-		dest[i] = 
-			new_value_with_discard<Distribution, value_type>(
+	for (size_t i = 0; i < parts - 1; ++i) {
+		fill_sample_part(
+			result, 
+			part_size * i, 
+			part_size, 
 			distribution, 
-			rng_copy, 
-			discard
-			);
+			rng, 
+			jump_mult
+		);
 	}
+	
+	size_t last_part_size = size - part_size * (parts - 1);
+	size_t last_part_begin = part_size * (parts - 1);
+	
+	fill_sample_part(
+		result, 
+		last_part_begin, 
+		last_part_size, 
+		distribution, 
+		rng, 
+		jump_mult
+	);
+
+	return result;
 }
 
 //parallel function for creating a sample of a distribution
@@ -85,12 +83,12 @@ std::vector<value_type> distribution_sample_parallel(
 	Distribution &distribution,
 	pcg32 &rng,  
 	size_t thread_count,
-	size_t discard = 1
+	size_t jump_mult = 1
 ) {
 	std::vector<value_type> result(size);
 
 	size_t thread_size = size / thread_count;
-	size_t last_elements = size - thread_size * thread_count;
+	size_t last_thread_size = size - thread_size * (thread_count - 1);
 
 	std::vector<std::thread> threads;
 
@@ -98,25 +96,23 @@ std::vector<value_type> distribution_sample_parallel(
 	for (size_t i = 0; i < thread_count - 1; ++i) {
 		threads.emplace_back(
 			fill_sample_part<Distribution, value_type>,
+			std::ref(result),
+			thread_size * i,
 			thread_size,
 			std::ref(distribution),
 			std::ref(rng),
-			thread_size * i, //advance generator by another thread_size steps
-			std::ref(result),
-			thread_size * i, //write after the previous part
-			discard
+			jump_mult
 		);
 	}
 	//thread for last thread_size + last_elements elements
 	threads.emplace_back(
 		fill_sample_part<Distribution, value_type>,
-		thread_size + last_elements,
-		std::ref(distribution),
-		std::ref(rng),
-		thread_size * (thread_count - 1),
 		std::ref(result),
 		thread_size * (thread_count - 1),
-		discard
+		last_thread_size,
+		std::ref(distribution),
+		std::ref(rng),
+		jump_mult
 	);
 
 	for (auto &thread : threads) {
@@ -128,7 +124,11 @@ std::vector<value_type> distribution_sample_parallel(
 
 
 //for functions of distributions
-template<class urng = pcg32, class Distribution = chosen_distribution, typename value_type = val_type>
+template<
+	class urng = pcg32, 
+	class Distribution = chosen_distribution, 
+	typename value_type = val_type
+>
 class FunctionalDistribution {
 private:
 	std::shared_ptr<Distribution> distribution;
@@ -152,8 +152,9 @@ public:
 
 //for rng
 const int SEED = 1;
-const int DISCARD = 100;
+const int DISCARD = 10;
 pcg32 rng(SEED);
+pcg32 rng_copy = rng;
 
 //for elapsed time
 clock_t t;
@@ -162,15 +163,86 @@ clock_t t;
 const double EPS = 1e-7;
 
 template<typename value_type = double, typename result_type = long double>
-value_type mean(std::vector<value_type>& sample) {
-	result_type res = 0;
-	size_t size = sample.size();
+result_type part_sum(
+	std::vector<value_type>& vector, 
+	size_t part_begin, 
+	size_t part_end
+) {
+	result_type sum = 0;
 
-	for (size_t i = 0; i < size; ++i) {
-		res += sample[i];
+	for (size_t i = 0; i < part_end; ++i) sum += vector[i];
+
+	return sum;
+}
+
+template<typename value_type = double, typename result_type = long double>
+void store_part_sum(
+	std::vector<value_type>& vector, 
+	size_t part_begin, 
+	size_t part_end, 
+	std::vector<result_type> results, 
+	size_t res_index
+) {
+	results[res_index] = part_sum<value_type, result_type>(
+		vector, 
+		part_begin, 
+		part_end
+		);
+}
+
+
+template<typename value_type = double, typename result_type = long double>
+result_type mean(
+	std::vector<value_type>& sample, 
+	size_t thread_count, 
+	bool mean_for_each = false
+) {
+	
+	std::vector<result_type> part_sums(thread_count);
+	std::vector<std::thread> threads;
+
+	size_t part_size = sample.size() / thread_count;
+	size_t last_part_size = sample.size() - part_size*(thread_count - 1);
+
+	for (size_t i = 0; i < thread_count - 1; ++i) {
+		threads.emplace_back(
+			store_part_sum<value_type, result_type>,
+			std::ref(sample),
+			i * part_size,
+			i * (part_size + 1),
+			std::ref(part_sums),
+			i
+		);
 	}
 
-	res /= size;
+	threads.emplace_back(
+		store_part_sum<value_type, result_type>,
+		std::ref(sample),
+		(thread_count - 1) * part_size,
+		sample.size(),
+		std::ref(part_sums),
+		thread_count - 1
+	);
+
+	for (auto &thread : threads) {
+		thread.join();
+	}
+
+	result_type res = 0;
+
+	if (mean_for_each) {
+		for (size_t i = 0; i < thread_count - 1; ++i) {
+			res += part_sums[i] / part_size;
+		}
+		res += part_sums[thread_count - 1] / last_part_size;
+		res /= thread_count;
+	}
+	else {
+		for (size_t i = 0; i < thread_count - 1; ++i) {
+			res += part_sums[i];
+		}
+		res /= sample.size();
+	}
 
 	return res;
 }
@@ -179,7 +251,11 @@ int main() {
 	std::normal_distribution<double> rnorm(0, 1);
 	std::uniform_int_distribution<int> runif_int(1, 10);
 
-	FunctionalDistribution<pcg32, std::normal_distribution<double>, double> rnorm_sin(
+	FunctionalDistribution<
+		pcg32, 
+		std::normal_distribution<double>, 
+		double
+	> rnorm_sin(
 		std::make_shared<std::normal_distribution<double>>(0, 1),
 		[](double input) {return sin(input); }
 	);
@@ -199,7 +275,8 @@ int main() {
 		distribution_sample<std::uniform_int_distribution<int>, int>(
 			100,
 			runif_int,
-			rng
+			rng_copy,
+			4
 			);
 
 	size_t size = runif_sample_parallel.size();
@@ -212,10 +289,15 @@ int main() {
 
 	std::cout << "Uniform int passed successfully" << std::endl;
 
+	system("pause");
+
 	//Check, if results are equal for distributions with random uses of rng:
 
 	std::vector<double> rnorm_sample_parallel =
-		distribution_sample_parallel<std::normal_distribution<double>, double>(
+		distribution_sample_parallel<
+		std::normal_distribution<double>, 
+		double
+		>(
 			100,
 			rnorm,
 			rng,
@@ -225,10 +307,14 @@ int main() {
 
 
 	std::vector<double> rnorm_sample_single =
-		distribution_sample<std::normal_distribution<double>, double>(
+		distribution_sample<
+		std::normal_distribution<double>, 
+		double
+		>(
 			100,
 			rnorm,
-			rng,
+			rng_copy,
+			4,
 			DISCARD
 			);
 
@@ -238,7 +324,7 @@ int main() {
 
 	for (size_t i = 0; i < size; ++i) {
 		assert(
-			fabs(rnorm_sample_parallel[i] - rnorm_sample_single[i]) < EPS
+			rnorm_sample_parallel[i] == rnorm_sample_single[i]
 		);
 	}
 
@@ -248,7 +334,10 @@ int main() {
 
 	t = clock();
 	std::vector<double> rnorm_sample_parallel_big =
-		distribution_sample_parallel<std::normal_distribution<double>, double>(
+		distribution_sample_parallel<
+		std::normal_distribution<double>, 
+		double
+		>(
 			10000000,
 			rnorm,
 			rng,
@@ -266,10 +355,14 @@ int main() {
 
 	t = clock();
 	std::vector<double> rnorm_sample_single_big =
-		distribution_sample<std::normal_distribution<double>, double>(
+		distribution_sample<
+		std::normal_distribution<double>, 
+		double
+		>(
 			10000000,
 			rnorm,
-			rng,
+			rng_copy,
+			4,
 			DISCARD
 			);
 	t = clock() - t;
@@ -285,23 +378,19 @@ int main() {
 
 	////Calculating means:
 
-	long double parallel_mean = mean<>(rnorm_sample_parallel_big);
-	long double single_mean = mean<>(rnorm_sample_single_big);
+	long double parallel_mean = 
+		mean<double, long double>(rnorm_sample_parallel_big, 4);
+	long double single_mean = 
+		mean<double, long double>(rnorm_sample_single_big, 4);
 
 	std::cout
-		<< "Comparing means of parallel and nonparallel N(0, 1) samples:"
+		<< "Comparing means of parallel and nonparallel sin(N(0, 1)) samples:"
 		<< std::endl
-		<< "Parallel mean: "
+		<< "Mean difference: "
 		<< std::fixed
-		<< std::setprecision(7)
-		<< parallel_mean
-		<< std::endl
-		<< "Single mean: "
-		<< std::fixed
-		<< std::setprecision(7)
-		<< single_mean
+		<< std::setprecision(15)
+		<< parallel_mean - single_mean
 		<< std::endl;
-
 
 	std::cout << "Mean comparison passed successfully" << std::endl;
 
@@ -309,7 +398,11 @@ int main() {
 
 	std::vector<double> rnorm_sin_sample_parallel =
 		distribution_sample_parallel<
-		FunctionalDistribution<pcg32, std::normal_distribution<double>, double>, 
+		FunctionalDistribution<
+		pcg32, 
+		std::normal_distribution<double>, 
+		double
+		>, 
 		double
 		>(
 			100000,
@@ -321,30 +414,32 @@ int main() {
 
 	std::vector<double> rnorm_sin_sample_single =
 		distribution_sample<
-		FunctionalDistribution<pcg32, std::normal_distribution<double>, double>,
+		FunctionalDistribution<
+		pcg32, 
+		std::normal_distribution<double>, 
+		double
+		>,
 		double
 		>(
 			100000,
 			rnorm_sin,
-			rng,
+			rng_copy,
+			4,
 			DISCARD
 			);
 
-	long double parallel_mean_sin = mean<>(rnorm_sin_sample_parallel);
-	long double single_mean_sin = mean<>(rnorm_sin_sample_single);
+	long double parallel_mean_sin = 
+		mean<double, long double>(rnorm_sin_sample_parallel, 4);
+	long double single_mean_sin = 
+		mean<double, long double>(rnorm_sin_sample_single, 4);
 
 	std::cout
 		<< "Comparing means of parallel and nonparallel sin(N(0, 1)) samples:"
 		<< std::endl
-		<< "Parallel mean: "
+		<< "Mean difference: "
 		<< std::fixed
-		<< std::setprecision(7)
-		<< parallel_mean_sin
-		<< std::endl
-		<< "Single mean: "
-		<< std::fixed
-		<< std::setprecision(7)
-		<< single_mean_sin
+		<< std::setprecision(15)
+		<< parallel_mean_sin - single_mean_sin
 		<< std::endl;
 
 
